@@ -66,7 +66,7 @@ export class ReverseProxyServer {
   private oauthPort = 3000;
   private oauthStateCache: Map<
     string,
-    { domain: string; cookies?: string[]; timestamp: number }
+    { domain: string; timestamp: number }
   > = new Map();
   private lastOAuthDomain?: string;
   private lastActiveDomain?: string;
@@ -196,14 +196,14 @@ export class ReverseProxyServer {
     // Universal OAuth 2.0 Authorization URL Rewriting:
     // If an authorization initiation redirect uses a .test or .local redirect_uri,
     // rewrite it to http://localhost:3000 for compatibility with providers that disallow custom HTTP TLDs,
-    // and remember the origin domain and initiation cookies in oauthStateCache.
+    // and remember the origin domain in oauthStateCache.
     this.proxy.on('proxyRes', (proxyRes, req) => {
       const rawHost = req.headers.host || '';
       const host = rawHost.split(':')[0].toLowerCase();
       const location = proxyRes.headers['location'];
 
       if (location) {
-        const bridgePort = 3000;
+        const bridgePort = this.oauthPort || 3000;
         const targetDomain =
           (host && host !== 'localhost' && host !== '127.0.0.1' ? host : undefined) ||
           this.lastOAuthDomain ||
@@ -244,13 +244,8 @@ export class ReverseProxyServer {
               const parsed = new URL(location);
               const state = parsed.searchParams.get('state');
               if (state && targetDomain) {
-                const rawSetCookie = proxyRes.headers['set-cookie'];
-                const cookies = rawSetCookie
-                  ? (Array.isArray(rawSetCookie) ? rawSetCookie : [rawSetCookie])
-                  : undefined;
                 this.oauthStateCache.set(state, {
                   domain: targetDomain,
-                  cookies,
                   timestamp: Date.now(),
                 });
               }
@@ -371,7 +366,7 @@ export class ReverseProxyServer {
     req: http.IncomingMessage,
     res: http.ServerResponse
   ): Promise<void> => {
-    // Universal OAuth 2.0 Bridge: Catch any request arriving at localhost:3000
+    // Universal OAuth 2.0 Bridge: Catch requests arriving at the configured OAuth port
     // and seamlessly redirect to http://[target_domain].test<path><query>
     const targetDomain = this.resolveTargetDomain(req);
     if (targetDomain) {
@@ -384,41 +379,6 @@ export class ReverseProxyServer {
         'Content-Type': 'text/html; charset=utf-8',
       };
 
-      // Transfer any cookies associated with OAuth state or present on localhost
-      const setCookies: string[] = [];
-      try {
-        const parsedUrl = new URL(req.url || '/', 'http://localhost');
-        const state = parsedUrl.searchParams.get('state');
-        if (state && this.oauthStateCache.has(state)) {
-          const cached = this.oauthStateCache.get(state);
-          if (cached?.cookies) {
-            for (const c of cached.cookies) {
-              const clean = c
-                .replace(/;\s*domain=[^;]+/gi, '')
-                .replace(/;\s*secure/gi, '')
-                .replace(/^(__Secure-|__Host-)/i, '');
-              setCookies.push(clean);
-            }
-          }
-        }
-      } catch {}
-
-      const cookieHeader = req.headers.cookie || '';
-      if (cookieHeader) {
-        const parts = cookieHeader.split(';');
-        for (const part of parts) {
-          const trimmed = part.trim();
-          if (trimmed && !trimmed.startsWith('hostmagic_target=')) {
-            const cleanNameVal = trimmed.replace(/^(__Secure-|__Host-)/i, '');
-            setCookies.push(`${cleanNameVal}; Path=/; SameSite=Lax`);
-          }
-        }
-      }
-
-      if (setCookies.length > 0) {
-        headers['Set-Cookie'] = setCookies;
-      }
-
       res.writeHead(statusCode, headers);
       res.end(`<!DOCTYPE html>
 <html>
@@ -426,7 +386,7 @@ export class ReverseProxyServer {
     <meta charset="utf-8">
     <title>OAuth Bridge Redirect</title>
     <script>
-      var target = ${JSON.stringify(targetUrl)};
+      var target = ${JSON.stringify(targetUrl).replace(/</g, '\\u003c')};
       if (window.location.hash) {
         window.location.replace(target + window.location.hash);
       } else {
@@ -435,7 +395,7 @@ export class ReverseProxyServer {
     </script>
   </head>
   <body>
-    <p>Redirecting to ${targetDomain}...</p>
+    <p>Redirecting to ${targetDomain.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;')}...</p>
   </body>
 </html>`);
       return;
@@ -1129,40 +1089,6 @@ export class ReverseProxyServer {
             'Content-Type': 'text/html; charset=utf-8',
           };
 
-          const setCookies: string[] = [];
-          try {
-            const parsedUrl = new URL(url, 'http://localhost');
-            const state = parsedUrl.searchParams.get('state');
-            if (state && this.oauthStateCache.has(state)) {
-              const cached = this.oauthStateCache.get(state);
-              if (cached?.cookies) {
-                for (const c of cached.cookies) {
-                  const clean = c
-                    .replace(/;\s*domain=[^;]+/gi, '')
-                    .replace(/;\s*secure/gi, '')
-                    .replace(/^(__Secure-|__Host-)/i, '');
-                  setCookies.push(clean);
-                }
-              }
-            }
-          } catch {}
-
-          const cookieHeader = req.headers.cookie || '';
-          if (cookieHeader) {
-            const parts = cookieHeader.split(';');
-            for (const part of parts) {
-              const trimmed = part.trim();
-              if (trimmed && !trimmed.startsWith('hostmagic_target=')) {
-                const cleanNameVal = trimmed.replace(/^(__Secure-|__Host-)/i, '');
-                setCookies.push(`${cleanNameVal}; Path=/; SameSite=Lax`);
-              }
-            }
-          }
-
-          if (setCookies.length > 0) {
-            headers['Set-Cookie'] = setCookies;
-          }
-
           res.writeHead(statusCode, headers);
           res.end(`<!DOCTYPE html>
 <html>
@@ -1170,7 +1096,7 @@ export class ReverseProxyServer {
     <meta charset="utf-8">
     <title>OAuth Bridge Redirect</title>
     <script>
-      var target = ${JSON.stringify(targetUrl)};
+      var target = ${JSON.stringify(targetUrl).replace(/</g, '\\u003c')};
       if (window.location.hash) {
         window.location.replace(target + window.location.hash);
       } else {
@@ -1179,7 +1105,7 @@ export class ReverseProxyServer {
     </script>
   </head>
   <body>
-    <p>Redirecting to ${targetDomain}...</p>
+    <p>Redirecting to ${targetDomain.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;')}...</p>
   </body>
 </html>`);
           return;
@@ -2962,4 +2888,3 @@ export class ReverseProxyServer {
     });
   }
 }
-

@@ -1,5 +1,6 @@
 import assert from 'node:assert';
 import http from 'node:http';
+import net from 'node:net';
 import { ReverseProxyServer } from '../src/core/proxy.js';
 import getPort from 'get-port';
 
@@ -11,7 +12,8 @@ const frontServer = http.createServer((req, res) => {
   if (req.url?.startsWith('/api/auth/signin/google')) {
     res.writeHead(302, {
       Location:
-        'https://accounts.google.com/o/oauth2/v2/auth?client_id=client123&redirect_uri=http://myapp.test/api/auth/callback/google&response_type=code',
+        'https://accounts.google.com/o/oauth2/v2/auth?client_id=client123&redirect_uri=http://myapp.test/api/auth/callback/google&response_type=code&state=state123',
+      'Set-Cookie': 'oauth_state=init123; Path=/; HttpOnly; Secure',
     });
     res.end();
     return;
@@ -61,6 +63,12 @@ const frontServer = http.createServer((req, res) => {
   }
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ service: 'frontend', path: req.url }));
+});
+frontServer.on('upgrade', (_req, socket) => {
+  socket.write(
+    'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'
+  );
+  socket.end();
 });
 await new Promise<void>((resolve) => frontServer.listen(frontPort, '127.0.0.1', () => resolve()));
 
@@ -195,8 +203,8 @@ try {
   const data9 = (await res9.json()) as any;
   assert.strictEqual(data9.service, 'frontend');
 
-  // Test 10: OAuth Initiation Rewrite (Rewrites .test redirect_uri to localhost:3000)
-  console.log('Test 10: OAuth initiation rewrite (.test -> localhost:3000)');
+  // Test 10: OAuth initiation rewrite uses the configured bridge port
+  console.log('Test 10: OAuth initiation rewrite uses configured bridge port');
   const res10 = await fetch(`http://127.0.0.1:${proxyPort}/api/auth/signin/google`, {
     headers: { Host: 'myapp.test' },
     redirect: 'manual',
@@ -204,11 +212,12 @@ try {
   assert.strictEqual(res10.status, 302);
   const rewrittenGoogleUrl = res10.headers.get('location') || '';
   assert.ok(
-    rewrittenGoogleUrl.includes('redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fapi%2Fauth%2Fcallback%2Fgoogle') ||
-    rewrittenGoogleUrl.includes('redirect_uri=http://localhost:3000/api/auth/callback/google'),
-    `Google redirect_uri must be rewritten to localhost:3000, got: ${rewrittenGoogleUrl}`
+    rewrittenGoogleUrl.includes(`redirect_uri=http%3A%2F%2Flocalhost%3A${oauthBridgePort}%2Fapi%2Fauth%2Fcallback%2Fgoogle`) ||
+    rewrittenGoogleUrl.includes(`redirect_uri=http://localhost:${oauthBridgePort}/api/auth/callback/google`),
+    `Google redirect_uri must be rewritten to localhost:${oauthBridgePort}, got: ${rewrittenGoogleUrl}`
   );
   assert.ok(!rewrittenGoogleUrl.includes('myapp.test'), 'Google redirect_uri must not contain .test domain');
+  assert.ok(res10.headers.get('set-cookie')?.includes('oauth_state=init123'));
 
   // Test 11: Universal OAuth Callback Interception on auxiliary bridge port (e.g. port 3000) -> Direct 302 to .test domain
   console.log('Test 11: OAuth callback on auxiliary bridge port redirects directly to .test domain');
@@ -239,7 +248,7 @@ try {
   // Test 12b: OAuth Callback on port 80 localhost also redirects cleanly to .test domain
   console.log('Test 12b: OAuth callback on port 80 localhost redirects to .test domain');
   const res12b = await fetch(`http://127.0.0.1:${proxyPort}/api/auth/callback/github?code=gh-code-123`, {
-    headers: { Host: 'localhost' },
+    headers: { Host: 'localhost', Cookie: 'custom_oauth_state=port80' },
     redirect: 'manual',
   });
   assert.strictEqual(res12b.status, 302);
@@ -247,6 +256,7 @@ try {
     res12b.headers.get('location'),
     'http://myapp.test/api/auth/callback/github?code=gh-code-123'
   );
+  assert.strictEqual(res12b.headers.get('set-cookie'), null);
 
   // Test 12c: Auth CSRF & Origin masking to localhost:3000
   console.log('Test 12c: Auth endpoints normalize Origin, Referer and x-forwarded-host to localhost:3000');
@@ -279,9 +289,9 @@ try {
   assert.ok(!cookie12d.includes('__Secure-'));
   assert.ok(!cookie12d.includes('Domain=localhost'));
 
-  // Test 12e: Cookie transfer and hash preservation on auxiliary bridge port
-  console.log('Test 12e: Cookie transfer and hash preservation on auxiliary bridge port');
-  const res12e = await fetch(`http://127.0.0.1:${oauthBridgePort}/api/auth/callback/google?code=code-abc`, {
+  // Test 12e: Bridge does not reissue cookies on localhost and preserves hashes
+  console.log('Test 12e: OAuth bridge avoids localhost cookie transfer and preserves hashes');
+  const res12e = await fetch(`http://127.0.0.1:${oauthBridgePort}/api/auth/callback/google?code=code-abc&state=state123`, {
     headers: {
       Host: 'localhost:3000',
       Cookie: 'custom_oauth_state=xyz123',
@@ -289,12 +299,69 @@ try {
     redirect: 'manual',
   });
   assert.strictEqual(res12e.status, 302);
-  assert.strictEqual(res12e.headers.get('location'), 'http://myapp.test/api/auth/callback/google?code=code-abc');
-  const cookie12e = res12e.headers.get('set-cookie') || '';
-  assert.ok(cookie12e.includes('custom_oauth_state=xyz123'));
+  assert.strictEqual(res12e.headers.get('location'), 'http://myapp.test/api/auth/callback/google?code=code-abc&state=state123');
+  assert.strictEqual(res12e.headers.get('set-cookie'), null);
   const html12e = await res12e.text();
   assert.ok(html12e.includes('window.location.hash'));
-  assert.ok(html12e.includes('http://myapp.test/api/auth/callback/google?code=code-abc'));
+  assert.ok(html12e.includes('http://myapp.test/api/auth/callback/google?code=code-abc&state=state123'));
+
+  // Test 12f: Raw redirect targets cannot break out of the bridge script element
+  console.log('Test 12f: OAuth bridge escapes raw script-closing request targets');
+  const rawBridgeResponse = await new Promise<string>((resolve, reject) => {
+    const socket = net.connect(oauthBridgePort, '127.0.0.1');
+    let response = '';
+    const timeout = setTimeout(() => {
+      socket.destroy();
+      reject(new Error('Timed out waiting for raw OAuth bridge response'));
+    }, 3000);
+    socket.on('connect', () => {
+      socket.write(
+        'GET /api/auth/callback/google</script><script>alert(1)</script>?state=state123 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'
+      );
+    });
+    socket.on('data', (chunk) => {
+      response += chunk.toString();
+    });
+    socket.on('end', () => {
+      clearTimeout(timeout);
+      resolve(response);
+    });
+    socket.on('error', (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+  });
+  const rawBridgeBody = rawBridgeResponse.slice(rawBridgeResponse.indexOf('\r\n\r\n') + 4);
+  assert.ok(rawBridgeBody.includes('\\u003c/script>'));
+  assert.ok(!rawBridgeBody.includes('</script><script>alert(1)'));
+
+  const rawPort80Response = await new Promise<string>((resolve, reject) => {
+    const socket = net.connect(proxyPort, '127.0.0.1');
+    let response = '';
+    const timeout = setTimeout(() => {
+      socket.destroy();
+      reject(new Error('Timed out waiting for raw port-80 OAuth response'));
+    }, 3000);
+    socket.on('connect', () => {
+      socket.write(
+        'GET /api/auth/callback/google</script><script>alert(1)</script>?state=state123 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'
+      );
+    });
+    socket.on('data', (chunk) => {
+      response += chunk.toString();
+    });
+    socket.on('end', () => {
+      clearTimeout(timeout);
+      resolve(response);
+    });
+    socket.on('error', (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+  });
+  const rawPort80Body = rawPort80Response.slice(rawPort80Response.indexOf('\r\n\r\n') + 4);
+  assert.ok(rawPort80Body.includes('\\u003c/script>'));
+  assert.ok(!rawPort80Body.includes('</script><script>alert(1)'));
 
   // Test 13: Intuitive localhost routing by Referer header & port parameter
   console.log('Test 13: Intuitive localhost routing by Referer & port parameter');
@@ -428,6 +495,32 @@ try {
   // Origin must be normalized to internal target port so Next.js never blocks dev resource
   assert.strictEqual(hmrData.origin, `http://127.0.0.1:${frontPort}`);
   assert.strictEqual(hmrData.forwardedHost, 'myapp.test');
+
+  const websocketResponse = await new Promise<string>((resolve, reject) => {
+    const socket = net.connect(proxyPort, '127.0.0.1');
+    let response = '';
+    const timeout = setTimeout(() => {
+      socket.destroy();
+      reject(new Error('Timed out waiting for proxied WebSocket upgrade'));
+    }, 3000);
+    socket.on('connect', () => {
+      socket.write(
+        'GET /_next/webpack-hmr HTTP/1.1\r\nHost: myapp.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n'
+      );
+    });
+    socket.on('data', (chunk) => {
+      response += chunk.toString();
+    });
+    socket.on('end', () => {
+      clearTimeout(timeout);
+      resolve(response);
+    });
+    socket.on('error', (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+  });
+  assert.ok(websocketResponse.startsWith('HTTP/1.1 101 Switching Protocols'));
 
   // Test 22: Preserves cross-origin header for Backend API CORS
   console.log('Test 22: Preserves original cross-origin header for backend API CORS');
@@ -578,9 +671,36 @@ try {
   });
   assert.strictEqual(settingsFaviconQueryRes.status, 200);
 
-  // Test 33: ProcessManager quiet mode suppresses stdout while saving to buffer
-  console.log('Test 33: ProcessManager quiet mode suppresses stdout while preserving buffer');
+  // Test 33: ProcessManager does not inherit unrelated database connection vars
+  console.log('Test 33: ProcessManager scrubs inherited database connection vars');
   const { ProcessManager } = await import('../src/core/process-manager.js');
+  const previousDirectUrl = process.env.DIRECT_URL;
+  const previousShadowDatabaseUrl = process.env.SHADOW_DATABASE_URL;
+  process.env.DIRECT_URL = 'postgres://shell/direct';
+  process.env.SHADOW_DATABASE_URL = 'postgres://shell/shadow';
+  const envManager = new ProcessManager({ quiet: true, handleSignals: false });
+  try {
+    await envManager.startService(process.cwd(), {
+      service: {
+        name: 'env-check',
+        path: '.',
+        type: 'custom',
+        domain: 'env-check.test',
+        command: 'node -e process.exit((process.env.DIRECT_URL||process.env.SHADOW_DATABASE_URL)?1:0)',
+      },
+      port: 0,
+      url: '',
+      env: { DATABASE_URL: 'postgres://service/database' },
+    });
+    await envManager.waitForAll();
+  } finally {
+    await envManager.stopAll();
+    if (previousDirectUrl === undefined) delete process.env.DIRECT_URL;
+    else process.env.DIRECT_URL = previousDirectUrl;
+    if (previousShadowDatabaseUrl === undefined) delete process.env.SHADOW_DATABASE_URL;
+    else process.env.SHADOW_DATABASE_URL = previousShadowDatabaseUrl;
+  }
+
   const quietManager = new ProcessManager({ quiet: true, handleSignals: false });
   assert.strictEqual(quietManager.isQuiet(), true);
 

@@ -22,7 +22,7 @@ if (typeof url.parse === 'function') {
       return (originalParse as any).apply(this, arguments);
     }
     try {
-      const isRelative = !urlStr.startsWith('http://') && !urlStr.startsWith('https://') && !urlStr.startsWith('//');
+      const isRelative = !/^[a-z][a-z\d+.-]*:/i.test(urlStr) && !urlStr.startsWith('//');
       const parsed = new URL(urlStr, 'http://localhost');
       const pathname = parsed.pathname;
       const search = parsed.search || null;
