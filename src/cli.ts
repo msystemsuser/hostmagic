@@ -1,3 +1,4 @@
+import './core/url-patch.js';
 import { Command } from 'commander';
 import { initCommand } from './commands/init.js';
 import { runCommand } from './commands/run.js';
@@ -12,7 +13,7 @@ const program = new Command();
 program
   .name('hostmagic')
   .description('Automate local fullstack dev with .test domains, ephemeral ports, and universal OAuth 2.0 on macOS, Linux, and Windows (alias: hm)')
-  .version('1.1.3')
+  .version('1.1.6')
   .option('-rs, --refresh-settings', 'Refresh hostmagic.settings dashboard and routes on the running gateway')
   .option('--rs', 'Alias for --refresh-settings')
   .option('-H, --hostfile', 'Open the system hosts file in your default editor across macOS, Linux, and Windows')
