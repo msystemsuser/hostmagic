@@ -1,10 +1,18 @@
 import assert from 'node:assert';
 import http from 'node:http';
 import net from 'node:net';
+import url from 'node:url';
 import { ReverseProxyServer } from '../src/core/proxy.js';
 import getPort from 'get-port';
 
 console.log('Running Reverse Proxy tests...');
+
+// Loading the proxy must not change Node's legacy URL parsing contract.
+const protocolRelativeUrl = url.parse('//example.com/path');
+assert.strictEqual(protocolRelativeUrl.protocol, null);
+assert.strictEqual(protocolRelativeUrl.href, '//example.com/path');
+const repeatedQueryUrl = url.parse('/path?a=1&a=2', true);
+assert.deepStrictEqual({ ...repeatedQueryUrl.query }, { a: ['1', '2'] });
 
 // 1. Setup mock frontend server
 const frontPort = await getPort();
